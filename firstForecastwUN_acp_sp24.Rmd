@@ -118,54 +118,7 @@ temp_lm_forecast_IU <- NULL
 temp_lm_forecast_PRU <- NULL
 ```
 
-# Driver Uncertainty 
-```{r forecast-loop}
-forecast_horizon <- 30
-forecast_dates <- seq(from = ymd(forecast_date), to = ymd(forecast_date) + forecast_horizon, by = "day")
-n_members <- 31
-
-
-for(i in 1:length(lake_sites$field_site_id)) {  
-  
-  curr_site <- lake_sites$field_site_id[i]
-  
-  # Get only the necessary data for the specific site
-  site_target <- targets_lm |>
-    filter(site_id == curr_site)
-
-  noaa_future_site <- noaa_future_daily |> 
-    filter(site_id == curr_site)
-  
-  #Fit linear model based on past data: water temperature = m * air temperature + b
-  fit <- lm(site_target$temperature ~ site_target$air_temperature + site_target$wind_speed)
-
-  # Loop through all forecast dates
-  for (t in 1:length(forecast_dates)) {
-  
-  #pull driver ensemble for the relevant date; here we are using all 30 NOAA ensemble members
-  site_drivers <- noaa_future_site %>%
-    filter(datetime == forecast_dates[t])
-  
-  # use linear regression to forecast water temperature for each ensemble member
-  forecasted_temperature <- fit$coefficients[1] + fit$coefficients[2] * site_drivers$air_temperature + 
-    site_drivers$wind_speed * fit$coefficients[3]
-    
-  # put all the relevant information into a tibble that we can bind together
-  curr_site_df <- tibble(datetime = rep(forecast_dates[t], times = n_members),
-                         site_id = curr_site,
-                         parameter = 1:n_members,
-                         prediction = forecasted_temperature,
-                         variable = "temperature") #Change this if you are forecasting a different variable
-  
-  temp_lm_forecast <- dplyr::bind_rows(temp_lm_forecast, curr_site_df)
-  
-  }
-  
-  message(curr_site, ' forecast run')
-}
-```
-
-# Parameter Uncertainty 
+# Parameter, process, and driver uncertainty 
 ```{r, warning = FALSE}
 forecast_horizon <- 30
 forecast_dates <- seq(from = ymd(forecast_date), to = ymd(forecast_date) + forecast_horizon, by = "day")
@@ -226,24 +179,6 @@ for(i in 1:length(lake_sites$field_site_id)) {
 
 ```
 
-
-```{r}
-# Make forecast fit the EFI standards
-# Remember to change the model_id when you make changes to the model structure!
-my_model_id <- 'example_ACP_sp24'
-
-temp_lm_forecast_EFI <- temp_lm_forecast %>%
-  filter(datetime > forecast_date) %>%
-  mutate(model_id = my_model_id,
-         reference_datetime = forecast_date,
-         family = 'ensemble',
-         parameter = as.character(parameter)) %>%
-  select(datetime, reference_datetime, site_id, family, parameter, variable, prediction, model_id)
-
-temp_lm_forecast_EFI$uc_type <- "Driver"
-
-```
-
 ```{r}
 # Make forecast fit the EFI standards
 # Remember to change the model_id when you make changes to the model structure!
@@ -293,14 +228,6 @@ neon4cast::forecast_output_validator(file.path('Forecasts',forecast_file_1))
 ```
 
 ```{r}
-temp_lm_forecast_EFI|> 
-  ggplot(aes(x=datetime, y=prediction, group = parameter)) +
-  geom_line() +
-  facet_wrap(~site_id) +
-  labs(title = paste0('Forecast generated for ', temp_lm_forecast_EFI$variable[1], ' on ', temp_lm_forecast_EFI$reference_datetime[1]))
-```
-
-```{r}
 temp_lm_forecast_EFI_PU |> 
   ggplot(aes(x=datetime, y=prediction, group = parameter)) +
   geom_line() +
@@ -308,31 +235,4 @@ temp_lm_forecast_EFI_PU |>
   labs(title = paste0('Forecast generated for ', temp_lm_forecast_EFI_PU$variable[1], ' on ', temp_lm_forecast_EFI_PU$reference_datetime[1]))
 ```
 
-```{r, echo = F, warning = F}
-temp_lm_forecast_PU %>% 
-  filter(variable == 'temperature') %>%
-  ggplot(.,aes(x=datetime, y=prediction, group = parameter)) + 
-  geom_point(data = targets,aes(x=datetime, y=observation, group = 'obs'), colour = 'darkblue') +
-  geom_line(alpha = 0.3, aes(colour = 'ensemble member (parameter)')) + 
-  facet_wrap(~site_id, scales = 'free_y') +
-  scale_x_date(expand = c(0,0), date_labels = "%d %b") +
-  labs(y = 'value') +
-  geom_vline(aes(linetype = 'reference_datetime', xintercept = Sys.Date()), colour = 'blue', size = 1.5) +
-  labs(title = 'site_id', subtitle = 'variable = temperature', caption = 'prediction') + 
-  annotate("text", x = Sys.Date() - days(10), y = 20, label = "past")  +
-  annotate("text", x = Sys.Date() + days(12), y = 20, label = "future")  +
-  theme_bw() +
-  coord_cartesian(xlim = c(min(temp_lm_forecast$datetime) - 15,
-                           Sys.Date() + 30)) +
-  scale_linetype_manual(values = 'dashed', name = '') +
-  scale_colour_manual(values = 'darkgrey', name = '') +
-  theme(strip.text = element_text(colour = 'orange'),
-        axis.title.y = element_text(colour = 'green'),
-        axis.title.x = element_text(colour = 'red'),
-        axis.text.y = element_text(colour = 'purple'),
-        axis.text.x = element_text(colour = 'red'),
-        plot.caption = element_text(hjust = 0, colour = 'purple'),
-        plot.title = element_text(colour = 'orange'), 
-        plot.subtitle = element_text(colour = 'green')) 
-```
 
