@@ -1,0 +1,179 @@
+---
+title: "FABLE Model"
+author: "Aaron Price"
+date: "2024-02-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+
+library(tsibble)
+library(fable)
+```
+
+```{r}
+targets <- read_csv('https://data.ecoforecast.org/neon4cast-targets/aquatics/aquatics-targets.csv.gz')
+
+aquatic_sites <- read_csv("https://raw.githubusercontent.com/eco4cast/neon4cast-targets/main/NEON_Field_Site_Metadata_20220412.csv") |>
+  dplyr::filter(aquatics == 1)
+
+lake_sites <- aquatic_sites %>%
+  filter(field_site_subtype == 'Lake')
+
+targets <- targets %>%
+  filter(site_id %in% lake_sites$field_site_id,
+         variable == 'temperature')
+
+noaa_past_s3 <- neon4cast::noaa_stage3()
+
+variables <- c("air_temperature", "eastward_wind", "northward_wind")
+
+noaa_past <- noaa_past_s3  |> 
+  dplyr::filter(site_id %in% lake_sites$field_site_id,
+                datetime >= ymd('2017-01-01'),
+                variable %in% variables) |> 
+  dplyr::collect() 
+  
+noaa_past_mean <- noaa_past |> 
+  mutate(datetime = as_date(datetime)) |> 
+  group_by(datetime, site_id, parameter, variable) |> 
+  summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
+  pivot_wider(names_from = variable, values_from = prediction) |> 
+  mutate(air_temperature = air_temperature - 273.15) |>
+  mutate(wind_speed = sqrt(northward_wind ^ 2 + eastward_wind ^2))
+
+forecast_date <- Sys.Date() 
+noaa_date <- forecast_date - days(2)
+
+noaa_future_s3 <- neon4cast::noaa_stage2(start_date = as.character(noaa_date))
+variables <- c("air_temperature", "eastward_wind", "northward_wind")
+
+noaa_future <- noaa_future_s3 |> 
+  dplyr::filter(datetime >= forecast_date,
+                site_id %in% lake_sites$field_site_id,
+                variable %in% variables) |> 
+  collect()
+
+
+noaa_future_daily <- noaa_future |> 
+  mutate(datetime = as_date(datetime)) |> 
+  group_by(datetime, site_id, parameter, variable) |> 
+  summarize(prediction = mean(prediction)) |>
+  pivot_wider(names_from = variable, values_from = prediction) |>
+  mutate(air_temperature = air_temperature - 273.15) |>
+  mutate(wind_speed = sqrt(northward_wind ^ 2 + eastward_wind ^2)) |>
+  select(datetime, site_id, air_temperature, eastward_wind, northward_wind, wind_speed, parameter)
+```
+
+```{r}
+targets_lm <- targets |> 
+  filter(variable == 'temperature') |>
+  pivot_wider(names_from = 'variable', values_from = 'observation') #|> 
+  #left_join(noaa_past_mean, 
+           # by = c("datetime","site_id")) 
+
+past_data <- noaa_past_mean |>  
+  select("datetime", "site_id", "parameter", "air_temperature", "wind_speed") |>
+  left_join(targets_lm,
+            by = c('datetime', 'site_id')) |>
+  filter(parameter == 4 ) |>
+  na.omit() |>
+  tsibble::as_tsibble(key = c('site_id', 'parameter'), index = 'datetime')
+  
+future_data <- noaa_future_daily |>
+  select("datetime", "site_id", "air_temperature", "wind_speed") |>
+  tsibble::as_tsibble(key = c('site_id', 'parameter'), index = c('datetime'))
+
+```
+
+```{r}
+forecast_all <- NULL
+
+for(i in 1:length(lake_sites$field_site_id)){
+  curr_site <- lake_sites$field_site_id[i]
+  
+BARC_past <- past_data |>
+    filter(site_id == curr_site)
+  BARC_fut <- future_data |>
+    filter(site_id == curr_site)
+  
+  site <- curr_site
+  variable <- "temperature"
+  max_horizon <- 35
+  
+  forecast_starts <- targets |> 
+    dplyr::filter(!is.na(observation) & site_id == curr_site & variable == variable) |> 
+    dplyr::summarise(start_date = max(datetime) + lubridate::days(1)) |>  # Date
+    dplyr::mutate(h = (Sys.Date() - start_date) + max_horizon,
+                  h = as.numeric(h)) |>  # Horizon value
+    dplyr::ungroup()
+  
+  TS_model <- BARC_past |>
+    fabletools::model(tslm = TSLM(temperature ~ air_temperature + wind_speed))
+  
+  forecast <- TS_model |>  
+    generate(h = forecast_starts$start_date, new_data = BARC_fut, bootstrap = T, times = 30) 
+  
+  forecast_df <- as.data.frame(forecast)
+  forecast_all <- bind_rows(forecast_all, forecast_df)
+}
+```
+
+
+```{r}
+forecast_df <- as.data.frame(forecast_all)
+forecast_df <- forecast_df |>
+  select(-parameter) |>
+  filter(.rep >= 3)
+
+
+RW_forecasts_EFI <- forecast_df |>
+  rename(parameter = .rep,
+        prediction = .sim) |>
+  group_by(site_id) |>
+  mutate(reference_datetime = Sys.Date(),
+         family = "ensemble",
+         model_id = "persistenceRW") |>
+  select(model_id, datetime, reference_datetime, site_id, family, parameter, prediction)
+
+RW_forecasts_EFI |> 
+  ggplot(aes(x=datetime, y=prediction, group = parameter)) +
+  geom_line() +
+  facet_wrap(~site_id) +
+  labs(title = paste0('Forecast generated for ', 'Temp', ' on ', RW_forecasts_EFI$reference_datetime[1]))
+```
+
+```{r write-forecast}
+theme <- 'aquatics'
+date <- RW_forecasts_EFI$reference_datetime[1]
+forecast_name_1 <- paste0(RW_forecasts_EFI$model_id[1], ".csv")
+forecast_file_1 <- paste(theme, date, forecast_name_1, sep = '-')
+forecast_file_1
+
+if (!dir.exists('Forecasts')) {
+  dir.create('Forecasts')
+}
+
+write_csv(RW_forecasts_EFI, file.path('Forecasts',forecast_file_1))
+
+neon4cast::forecast_output_validator(file.path('Forecasts',forecast_file_1))
+
+```
+
+```{r submit-forecast}
+
+## # can uses the neon4cast::forecast_output_validator() to check the forecast is in the right format
+
+# UNCOMMMENT THIS WHEN YOU ARE READY TO SUBMIT
+#neon4cast::submit(forecast_file = file.path('Forecasts', forecast_file_1),
+#                   ask = T) 
+#if ask = T (default), it will produce a pop-up box asking if you want to submit
+
+
+```
