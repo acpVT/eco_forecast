@@ -32,7 +32,8 @@ targets <- targets %>%
 
 noaa_past_s3 <- neon4cast::noaa_stage3()
 
-variables <- c("air_temperature", "eastward_wind", "northward_wind")
+variables <- c("air_temperature", "eastward_wind", "northward_wind",
+               "precipitation_flux")
 
 noaa_past <- noaa_past_s3  |> 
   dplyr::filter(site_id %in% lake_sites$field_site_id,
@@ -46,13 +47,14 @@ noaa_past_mean <- noaa_past |>
   summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
   pivot_wider(names_from = variable, values_from = prediction) |> 
   mutate(air_temperature = air_temperature - 273.15) |>
-  mutate(wind_speed = sqrt(northward_wind ^ 2 + eastward_wind ^2))
+  mutate(wind_speed = sqrt(northward_wind ^ 2 + eastward_wind ^2)) 
 
 forecast_date <- Sys.Date() 
 noaa_date <- forecast_date - days(2)
 
 noaa_future_s3 <- neon4cast::noaa_stage2(start_date = as.character(noaa_date))
-variables <- c("air_temperature", "eastward_wind", "northward_wind")
+variables <- c("air_temperature", "eastward_wind", "northward_wind",
+               'precipitation_flux')
 
 noaa_future <- noaa_future_s3 |> 
   dplyr::filter(datetime >= forecast_date,
@@ -64,11 +66,12 @@ noaa_future <- noaa_future_s3 |>
 noaa_future_daily <- noaa_future |> 
   mutate(datetime = as_date(datetime)) |> 
   group_by(datetime, site_id, parameter, variable) |> 
-  summarize(prediction = mean(prediction)) |>
+  summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |>
   pivot_wider(names_from = variable, values_from = prediction) |>
   mutate(air_temperature = air_temperature - 273.15) |>
-  mutate(wind_speed = sqrt(northward_wind ^ 2 + eastward_wind ^2)) |>
-  select(datetime, site_id, air_temperature, eastward_wind, northward_wind, wind_speed, parameter)
+  mutate(wind_speed = sqrt(northward_wind ^ 2 + eastward_wind ^2))
+  #select(datetime, site_id, air_temperature, eastward_wind, northward_wind, wind_speed, parameter)
+
 ```
 
 ```{r}
@@ -79,27 +82,53 @@ targets_lm <- targets |>
            # by = c("datetime","site_id")) 
 
 past_data <- noaa_past_mean |>  
-  select("datetime", "site_id", "parameter", "air_temperature", "wind_speed") |>
+  select("datetime", "site_id", "parameter", "air_temperature", "wind_speed",
+         'precipitation_flux') |>
   left_join(targets_lm,
             by = c('datetime', 'site_id')) |>
-  filter(parameter == 4 ) |>
+  filter(parameter == 10 ) |>
+  tsibble::as_tsibble(key = c('site_id', 'parameter'), index = 'datetime') |>
   na.omit() |>
-  tsibble::as_tsibble(key = c('site_id', 'parameter'), index = 'datetime')
+  tsibble::fill_gaps()
+
+for(i in 1:length(past_data$datetime)){
+  if(i < 5){
+    past_data$total_precip[i] <- past_data$precipitation_flux[i]
+  } else {
+    fD_precip <- c(past_data$precipitation_flux[i-4], 
+                past_data$precipitation_flux[i])
+    past_data$total_precip[i] <- sum(fD_precip)
+  }
+}
   
 future_data <- noaa_future_daily |>
-  select("datetime", "site_id", "air_temperature", "wind_speed") |>
-  tsibble::as_tsibble(key = c('site_id', 'parameter'), index = c('datetime'))
+  select("datetime", "parameter", "site_id", "air_temperature", "wind_speed", 
+         'precipitation_flux') |>
+  na.omit() |>
+  tsibble::as_tsibble(key = c('site_id', 'parameter'), index = c('datetime')) |>
+  fill_gaps()
 
+for(i in 1:length(future_data$datetime)){
+  if(i < 5){
+    future_data$total_precip[i] <- future_data$precipitation_flux[i]
+  } else {
+    fD_precip <- c(future_data$precipitation_flux[i-4], 
+                future_data$precipitation_flux[i])
+    future_data$total_precip[i] <- sum(fD_precip)
+  }
+}
 ```
 
 ```{r}
 forecast_all <- NULL
+forecast_all_nn <- NULL
 
 for(i in 1:length(lake_sites$field_site_id)){
   curr_site <- lake_sites$field_site_id[i]
   
 BARC_past <- past_data |>
     filter(site_id == curr_site)
+
   BARC_fut <- future_data |>
     filter(site_id == curr_site)
   
@@ -114,17 +143,23 @@ BARC_past <- past_data |>
                   h = as.numeric(h)) |>  # Horizon value
     dplyr::ungroup()
   
+  
   TS_model <- BARC_past |>
-    fabletools::model(tslm = TSLM(temperature ~ air_temperature + wind_speed))
+    fabletools::model(tslm = TSLM(temperature ~ air_temperature + wind_speed + total_precip))
   
   forecast <- TS_model |>  
-    generate(h = forecast_starts$start_date, new_data = BARC_fut, bootstrap = T, times = 30) 
+    generate(h = forecast_starts$h, new_data = BARC_fut, bootstrap = T, times = 30) 
   
   forecast_df <- as.data.frame(forecast)
   forecast_all <- bind_rows(forecast_all, forecast_df)
-}
-```
 
+}
+
+forecast_res <- generate(TS_model, new_data = BARC_past, bootstrap = T, times = 20)
+lm_res <- lm(forecast_res$temperature ~ forecast_res$.sim)
+summary(lm_res)
+plot(forecast_res$temperature, forecast_res$.sim)
+```
 
 ```{r}
 forecast_df <- as.data.frame(forecast_all)
@@ -143,6 +178,147 @@ RW_forecasts_EFI <- forecast_df |>
   select(model_id, datetime, reference_datetime, site_id, family, parameter, prediction)
 
 RW_forecasts_EFI |> 
+  ggplot(aes(x=datetime, y=prediction, group = parameter)) +
+  geom_line() +
+  facet_wrap(~site_id) +
+  labs(title = paste0('Forecast generated for ', 'Temp', ' on ', RW_forecasts_EFI$reference_datetime[1]))
+```
+
+
+
+```{r}
+targets_lm <- targets |> 
+  filter(variable == 'temperature') |>
+  pivot_wider(names_from = 'variable', values_from = 'observation') #|> 
+  #left_join(noaa_past_mean, 
+           # by = c("datetime","site_id")) 
+
+past_data <- noaa_past_mean |>  
+  select("datetime", "site_id", "parameter", "air_temperature", "wind_speed",
+         'precipitation_flux') |>
+  left_join(targets_lm,
+            by = c('datetime', 'site_id')) |>
+  filter(parameter == 10 ) |>
+  tsibble::as_tsibble(key = c('site_id', 'parameter'), index = 'datetime') |>
+  na.omit() |>
+  tsibble::fill_gaps()
+
+for(i in 1:length(past_data$datetime)){
+  if(i < 5){
+    past_data$total_precip[i] <- past_data$precipitation_flux[i]
+  } else {
+    fD_precip <- c(past_data$precipitation_flux[i-4], 
+                past_data$precipitation_flux[i])
+    past_data$total_precip[i] <- sum(fD_precip)
+  }
+  if(is.na(past_data$temperature[i])){
+    past_data$temperature[i] <- past_data$temperature[i-1]
+  }
+}
+  
+future_data <- noaa_future_daily |>
+  select("datetime", "parameter", "site_id", "air_temperature", "wind_speed", 
+         'precipitation_flux') |>
+  na.omit() |>
+  tsibble::as_tsibble(key = c('site_id', 'parameter'), index = c('datetime')) |>
+  fill_gaps()
+
+for(i in 1:length(future_data$datetime)){
+  if(i < 5){
+    future_data$total_precip[i] <- future_data$precipitation_flux[i]
+  } else {
+    fD_precip <- c(future_data$precipitation_flux[i-4], 
+                future_data$precipitation_flux[i])
+    future_data$total_precip[i] <- sum(fD_precip)
+  }
+}
+```
+
+```{r}
+forecast_all_nn <- NULL
+
+#lake_sites <- lake_sites[1:5,]
+
+for(i in 1:length(lake_sites$field_site_id)){
+  curr_site <- lake_sites$field_site_id[i]
+  
+  BARC_past <- past_data |>
+    filter(site_id == curr_site)
+
+  BARC_fut <- future_data |>
+    filter(site_id == curr_site)
+  
+  site <- curr_site
+  variable <- "temperature"
+  max_horizon <- 35
+  
+  forecast_starts <- targets |> 
+    dplyr::filter(!is.na(observation) & site_id == curr_site & variable == variable) |> 
+    dplyr::summarise(start_date = max(datetime) + lubridate::days(1)) |>  # Date
+    dplyr::mutate(h = (Sys.Date() - start_date) + max_horizon,
+                  h = as.numeric(h)) |>  # Horizon value
+    dplyr::ungroup()
+  
+  fit <- lm(BARC_past$temperature ~ BARC_past$wind_speed + 
+              BARC_past$air_temperature + 
+              BARC_past$precipitation_flux)
+  
+  nn_model <- BARC_past |>
+    model(nn = NNETAR(box_cox(temperature, 0.15)))
+  
+  forecast_nn <- generate(nn_model, new_data = BARC_fut, bootstrap = T, times = 200)  
+  
+  forecast_nn <- as.data.frame(forecast_nn)
+  forecast_all_nn <- bind_rows(forecast_all_nn, forecast_nn)
+}
+
+forecast_res <- generate(nn_model, new_data = BARC_past, bootstrap = T, times = 20)
+lm_res <- lm(forecast_res$temperature ~ forecast_res$.sim)
+summary(lm_res)
+plot(forecast_res$temperature, forecast_res$.sim)
+```
+
+```{r}
+forecast_df <- as.data.frame(forecast_all)
+forecast_df <- forecast_df |>
+  select(-parameter) |>
+  filter(.rep >= 3)
+
+
+LM_forecasts_EFI <- forecast_df |>
+  rename(parameter = .rep,
+        prediction = .sim) |>
+  group_by(site_id) |>
+  mutate(reference_datetime = Sys.Date(),
+         family = "ensemble",
+         model_id = "persistenceRW") |>
+  select(model_id, datetime, reference_datetime, site_id, family, parameter, prediction)
+
+LM_forecasts_EFI |> 
+  ggplot(aes(x=datetime, y=prediction, group = parameter)) +
+  geom_line() +
+  facet_wrap(~site_id) +
+  labs(title = paste0('Forecast generated for ', 'Temp', ' on ', RW_forecasts_EFI$reference_datetime[1]))
+
+forecast_df <- as.data.frame(forecast_all_nn)
+forecast_df <- forecast_df |>
+  select(-parameter) |>
+  filter(.rep >= 3)
+
+
+NN_forecasts_EFI <- forecast_df |>
+  rename(parameter = .rep,
+        prediction = .sim) |>
+  group_by(site_id) |>
+  mutate(reference_datetime = Sys.Date(),
+         family = "ensemble",
+         model_id = "persistenceRW",
+         parameter = parameter + "n") |>
+  select(model_id, datetime, reference_datetime, site_id, family, parameter, prediction)
+
+both <- bind_rows(NN_forecast_EFI, LM_forecasts_EFI)
+
+NN_forecasts_EFI |> 
   ggplot(aes(x=datetime, y=prediction, group = parameter)) +
   geom_line() +
   facet_wrap(~site_id) +
